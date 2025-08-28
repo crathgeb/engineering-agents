@@ -1,0 +1,17 @@
+{
+  "repositories": [
+    {
+      "name": "React",
+      "owner": "facebook", 
+      "repo": "react"
+    },
+    {
+      "name": "Vue",
+      "owner": "vuejs",
+      "repo": "core"
+    }
+  ],
+  "settings": {
+    "github_username": "your-github-username"
+  }
+}
