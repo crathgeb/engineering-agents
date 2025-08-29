@@ -101,18 +101,18 @@ get_git_user() {
     echo "$github_username"
 }
 
-# Calculate date 24 hours ago in ISO format
+# Calculate date for standup lookback (30 hours to catch previous work day)
 get_since_date() {
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS
-        date -u -v-1d +"%Y-%m-%dT%H:%M:%SZ"
+        # macOS - look back 30 hours to catch previous work day
+        date -u -v-30H +"%Y-%m-%dT%H:%M:%SZ"
     else
-        # Linux
-        date -u -d "24 hours ago" +"%Y-%m-%dT%H:%M:%SZ"
+        # Linux - look back 30 hours to catch previous work day  
+        date -u -d "30 hours ago" +"%Y-%m-%dT%H:%M:%SZ"
     fi
 }
 
-# Fetch commits for a repository
+# Fetch commits for a repository (checking all branches)
 fetch_commits() {
     local owner="$1"
     local repo="$2"
@@ -122,22 +122,43 @@ fetch_commits() {
     
     log_info "Fetching commits for $owner/$repo since $since_date..."
     
-    # Fetch commits using GitHub API
-    local commits_json
-    local api_response
-    api_response=$(gh api "repos/$owner/$repo/commits?since=$since_date" 2>&1)
+    # First get all branches to check
+    local branches_json
+    branches_json=$(gh api "repos/$owner/$repo/branches" 2>/dev/null || echo "[]")
     
-    # Check if the API call was successful
-    if echo "$api_response" | grep -q "^gh: Not Found\|^gh: Forbidden\|\"message\": \"Not Found\""; then
+    # Collect all commits from all branches
+    local all_commits="[]"
+    
+    # Get branches to check (limit to reasonable number for performance)
+    local branch_names
+    branch_names=$(echo "$branches_json" | jq -r '.[0:10] | .[] | .name' 2>/dev/null || echo "main")
+    
+    while IFS= read -r branch_name; do
+        if [[ -n "$branch_name" ]]; then
+            local api_response
+            api_response=$(gh api "repos/$owner/$repo/commits?sha=$branch_name&since=$since_date" 2>&1)
+            
+            # Check if the API call was successful for this branch
+            if echo "$api_response" | grep -q "^gh: Not Found\|^gh: Forbidden\|\"message\": \"Not Found\""; then
+                continue  # Skip this branch, may not exist or not accessible
+            elif echo "$api_response" | grep -q "^gh: .*Error\|^gh: .*error\|^gh: Failed\|^gh: HTTP"; then
+                continue  # Skip this branch on API error
+            elif ! echo "$api_response" | jq empty 2>/dev/null; then
+                continue  # Skip invalid JSON
+            else
+                # Merge commits from this branch into all_commits
+                all_commits=$(echo "$all_commits $api_response" | jq -s 'add | unique_by(.sha)' 2>/dev/null || echo "$all_commits")
+            fi
+        fi
+    done <<< "$branch_names"
+    
+    # Check if we got any commits at all
+    if [[ "$all_commits" == "[]" || -z "$all_commits" ]]; then
         log_warning "Repository $owner/$repo not found or not accessible"
         return 1
-    elif echo "$api_response" | head -1 | grep -q "^gh: "; then
-        local error_msg=$(echo "$api_response" | head -1 | sed 's/^gh: //')
-        log_warning "API error accessing $owner/$repo: $error_msg"
-        return 1
-    else
-        commits_json="$api_response"
     fi
+    
+    local commits_json="$all_commits"
     
     if [[ "$commits_json" != "[]" && -n "$commits_json" && "$commits_json" != "null" ]]; then
         # Filter commits by author
@@ -158,7 +179,7 @@ fetch_commits() {
     fi
     
     log_info "No commits found for $username in $owner/$repo"
-    return 1
+    return 2
 }
 
 # Fetch pull requests for a repository
@@ -180,9 +201,12 @@ fetch_pull_requests() {
     if echo "$api_response" | grep -q "^gh: Not Found\|^gh: Forbidden\|\"message\": \"Not Found\""; then
         log_warning "Repository $owner/$repo not found or not accessible"
         return 1
-    elif echo "$api_response" | head -1 | grep -q "^gh: "; then
+    elif echo "$api_response" | grep -q "^gh: .*Error\|^gh: .*error\|^gh: Failed\|^gh: HTTP"; then
         local error_msg=$(echo "$api_response" | head -1 | sed 's/^gh: //')
         log_warning "API error accessing $owner/$repo: $error_msg"
+        return 1
+    elif ! echo "$api_response" | jq empty 2>/dev/null; then
+        log_warning "Invalid JSON response from $owner/$repo"
         return 1
     else
         prs_created_json="$api_response"
@@ -304,7 +328,7 @@ fetch_pull_requests() {
         return 0
     else
         log_info "No pull requests found for $username in $owner/$repo"
-        return 1
+        return 2
     fi
 }
 
@@ -393,7 +417,7 @@ main() {
             echo "- Your GitHub CLI authentication is working (run \`gh auth status\`)" >> "$output_file"
             echo "- Repository name and owner are spelled correctly" >> "$output_file"
             log_error "Could not access repository $name"
-        elif [[ "$has_commits" == "false" && "$has_prs" == "false" ]]; then
+        elif [[ "$has_commits" == "false" && "$has_prs" == "false" ]] || [[ $commits_exit_code -eq 2 && $prs_exit_code -eq 2 ]]; then
             echo "## No Activity Found" >> "$output_file"
             echo "" >> "$output_file"
             echo "No commits or pull requests found for $github_username in the last 24 hours." >> "$output_file"
